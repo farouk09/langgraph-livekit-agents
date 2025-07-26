@@ -2,11 +2,10 @@
 LangGraphAdapter masquerades as an livekit.LLM and translates the LiveKit chat chunks
 into LangGraph messages.
 """
-
 from typing import Any, Optional, Dict
 from livekit.agents import llm
-from langgraph.pregel import PregelProtocol
-from langchain_core.messages import BaseMessageChunk, AIMessage, HumanMessage
+from langgraph.pregel.protocol import PregelProtocol
+from langchain_core.messages import BaseMessageChunk, AIMessage, HumanMessage, ToolMessage
 from livekit.agents.types import APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS
 from livekit.agents.tts import SynthesizeStream
 from livekit.agents.utils import shortuuid
@@ -14,15 +13,27 @@ from langgraph.types import Command
 from langgraph.errors import GraphInterrupt
 from httpx import HTTPStatusError
 
+
 import logging
 
-logger = logging.getLogger(__name__)
+
+# ---------- Logging configuration ----------
+logger = logging.getLogger("LangGraphIntegration")
+logger.setLevel(logging.DEBUG)
+file_handler = logging.FileHandler("langgraph_integration.log")
+formatter = logging.Formatter('%(asctime)s - LangGraph integration - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+# ------------------------------------------
+
 
 
 # https://github.com/livekit/agents/issues/1370#issuecomment-2588821571
+
 class FlushSentinel(str, SynthesizeStream._FlushSentinel):
     def __new__(cls, *args, **kwargs):
         return super().__new__(cls, *args, **kwargs)
+    
 
 
 class LangGraphStream(llm.LLMStream):
@@ -31,12 +42,10 @@ class LangGraphStream(llm.LLMStream):
         llm: llm.LLM,
         chat_ctx: llm.ChatContext,
         graph: PregelProtocol,
-        fnc_ctx: Optional[Dict] = None,
+        tools: list[llm.FunctionTool] = None,
         conn_options: APIConnectOptions = None,
     ):
-        super().__init__(
-            llm, chat_ctx=chat_ctx, fnc_ctx=fnc_ctx, conn_options=conn_options
-        )
+        super().__init__(llm, chat_ctx=chat_ctx, tools=tools, conn_options=conn_options)
         self._graph = graph
 
     async def _run(self):
@@ -44,7 +53,7 @@ class LangGraphStream(llm.LLMStream):
         input_human_message = next(
             (
                 self._to_message(m)
-                for m in reversed(self.chat_ctx.messages)
+                for m in reversed(self.chat_ctx.items)
                 if m.role == "user"
             ),
             None,
@@ -61,28 +70,38 @@ class LangGraphStream(llm.LLMStream):
             ]
 
             input = Command(resume=(input_human_message.content, used_messages))
-
+        
         try:
             async for mode, data in self._graph.astream(
                 input, config=self._llm._config, stream_mode=["messages", "custom"]
             ):
                 if mode == "messages":
-                    if chunk := await self._to_livekit_chunk(data[0]):
-                        self._event_ch.send_nowait(chunk)
+                    message = data[0]
 
+                    # Check if it's a tool message by both isinstance and type attribute
+                    is_tool_message = (
+                        isinstance(message, ToolMessage) or 
+                        (hasattr(message, 'type') and message.type == 'tool') or
+                        (isinstance(message, dict) and message.get('type') == 'tool')
+                    )
+                    
+                    if not is_tool_message:
+                        if chunk := await self._to_livekit_chunk(message):
+                            self._event_ch.send_nowait(chunk)
+                    else:
+                        logger.debug(f"Skipping tool message: {message}")
+                        
                 if mode == "custom":
                     if isinstance(data, dict) and (event := data.get("type")):
                         if event == "say" or event == "flush":
                             content = (data.get("data") or {}).get("content")
                             if chunk := await self._to_livekit_chunk(content):
                                 self._event_ch.send_nowait(chunk)
-
                             self._event_ch.send_nowait(
                                 self._create_livekit_chunk(FlushSentinel())
                             )
         except GraphInterrupt:
             pass
-
         # If interrupted, send the string as a message
         if interrupt := await self._get_interrupt():
             if chunk := await self._to_livekit_chunk(interrupt.value):
@@ -105,7 +124,6 @@ class LangGraphStream(llm.LLMStream):
             return assistant
         except HTTPStatusError as e:
             return None
-
     def _to_message(cls, msg: llm.ChatMessage) -> HumanMessage:
         if isinstance(msg.content, str):
             content = msg.content
@@ -123,9 +141,7 @@ class LangGraphStream(llm.LLMStream):
                     logger.warning("Unsupported content type")
         else:
             content = ""
-
         return HumanMessage(content=content, id=msg.id)
-
     @staticmethod
     def _create_livekit_chunk(
         content: str,
@@ -133,10 +149,8 @@ class LangGraphStream(llm.LLMStream):
         id: str | None = None,
     ) -> llm.ChatChunk | None:
         return llm.ChatChunk(
-            request_id=id or shortuuid(),
-            choices=[
-                llm.Choice(delta=llm.ChoiceDelta(role="assistant", content=content))
-            ],
+            id=id or shortuuid(),
+            delta=llm.ChoiceDelta(role="assistant", content=content),
         )
 
     @staticmethod
@@ -145,10 +159,8 @@ class LangGraphStream(llm.LLMStream):
     ) -> llm.ChatChunk | None:
         if not msg:
             return None
-
         request_id = None
         content = msg
-
         if isinstance(msg, str):
             content = msg
         elif hasattr(msg, "content") and isinstance(msg.content, str):
@@ -157,26 +169,25 @@ class LangGraphStream(llm.LLMStream):
         elif isinstance(msg, dict):
             request_id = msg.get("id")
             content = msg.get("content")
-
         return LangGraphStream._create_livekit_chunk(content, id=request_id)
-
-
+    
+    
 class LangGraphAdapter(llm.LLM):
     def __init__(self, graph: Any, config: dict[str, Any] | None = None):
         super().__init__()
         self._graph = graph
         self._config = config
-
     def chat(
         self,
         chat_ctx: llm.ChatContext,
-        fnc_ctx: llm.FunctionContext,
+        tools: list[llm.FunctionTool] = None,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+        **kwargs,
     ) -> llm.LLMStream:
         return LangGraphStream(
             self,
             chat_ctx=chat_ctx,
             graph=self._graph,
-            fnc_ctx=fnc_ctx,
+            tools=tools,
             conn_options=conn_options,
         )
